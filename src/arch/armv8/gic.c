@@ -97,12 +97,19 @@ void gic_init(void)
 
 void gic_handle()
 {
+    // ack 추출 - pending >> active 
     uint32_t ack = gicc_iar();
+    // id 추출
     irqid_t id = bit32_extract(ack, GICC_IAR_ID_OFF, GICC_IAR_ID_LEN);
 
+    // 일반 인터럽트 처리
     if (id < GIC_FIRST_SPECIAL_INTID) {
         enum irq_res res = interrupts_handle(id);
+
+        // eoi - priority drop
         gicc_eoir(ack);
+
+        // dir - deactivate
         if (res == HANDLED_BY_HYP) {
             gicc_dir(ack);
         }

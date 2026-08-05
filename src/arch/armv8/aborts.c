@@ -14,10 +14,10 @@
 
 typedef void (*abort_handler_t)(unsigned long, unsigned long, unsigned long, unsigned long);
 
+/* BAO-01: Guest IROUTER MMIO trap -> aborts_data_lower -> vgicd_emul_handler */
 static void aborts_data_lower(unsigned long iss, unsigned long far, unsigned long il,
     unsigned long ec)
 {
-    UNUSED_ARG(ec);
 
     if (!(iss & ESR_ISS_DA_ISV_BIT) || (iss & ESR_ISS_DA_FnV_BIT)) {
         ERROR("no information to handle data abort (0x%x)\n", far);
@@ -41,6 +41,19 @@ static void aborts_data_lower(unsigned long iss, unsigned long far, unsigned lon
         emul.sign_ext = bit_extract(iss, ESR_ISS_DA_SSE_OFF, ESR_ISS_DA_SSE_LEN);
 
         // TODO: check if the access is aligned. If not, inject an exception in the vm
+
+        {
+            unsigned long gicd_off = (unsigned long)addr & 0xffffUL;
+            if (gicd_off >= 0x6000UL && gicd_off < 0x8000UL) {
+                unsigned long rt_val = emul.write ? vcpu_readreg(cpu()->vcpu, emul.reg) : 0;
+                INFO("bao_poc: flow1 aborts_data_lower iss=0x%lx far=0x%lx il=%lu ec=0x%lx "
+                     "write=%d width=%u reg=%lu rt_val=0x%lx vcpu_id=%u phys_id=%u "
+                     "next=vgicd_emul_handler\n",
+                    iss, (unsigned long)far, il, ec, emul.write ? 1 : 0,
+                    (unsigned)emul.width, (unsigned long)emul.reg, rt_val,
+                    (unsigned)cpu()->vcpu->id, (unsigned)cpu()->vcpu->phys_id);
+            }
+        }
 
         if (handler(&emul)) {
             unsigned long pc_step = 2 + (2 * il);
@@ -194,6 +207,14 @@ void aborts_sync_handler(void)
 
     abort_handler_t handler = abort_handlers[ec];
     if (handler) {
+        if (ec == ESR_EC_DALEL) {
+            unsigned long gicd_off = ipa_fault_addr & 0xffffUL;
+            if (gicd_off >= 0x6000UL && gicd_off < 0x8000UL) {
+                INFO("bao_poc: flow0 aborts_sync_handler ec=0x%lx(DALEL) iss=0x%lx "
+                     "ipa=0x%lx il=%lu -> aborts_data_lower\n",
+                    ec, iss, ipa_fault_addr, il);
+            }
+        }
         handler(iss, ipa_fault_addr, il, ec);
         if (vcpu_arch_is_on(cpu()->vcpu) && !cpu()->vcpu->active) {
             cpu_standby();

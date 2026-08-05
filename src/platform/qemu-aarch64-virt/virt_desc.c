@@ -7,7 +7,7 @@
 
 struct platform platform = {
 
-    .cpu_num = 4,
+    .cpu_num = 17,
     .region_num = 1,
     .regions =  (struct mem_region[]) {
         {
@@ -21,6 +21,12 @@ struct platform platform = {
     },
 
     .arch = {
+        /* BAO-01: -smp 17, phys_id16 -> MPIDR 0x100 (GICv3 Aff0 width 16). */
+        .clusters = {
+            .num = 2,
+            .core_num = (size_t[]){ 16, 1 },
+        },
+
         .gic = {
             .gicd_addr = 0x08000000,
             .gicc_addr = 0x08010000,

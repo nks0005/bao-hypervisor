@@ -12,6 +12,7 @@
 #include <interrupts.h>
 #include <vm.h>
 #include <platform.h>
+#include <bao.h>
 
 #define GICR_IS_REG(REG, offset)                    \
     (((offset) >= offsetof(struct gicr_hw, REG)) && \
@@ -30,12 +31,32 @@ bool vgic_int_has_other_target(struct vcpu* vcpu, struct vgic_int* interrupt)
     return any || (!routed_here && route_valid);
 }
 
-uint8_t vgic_int_ptarget_mask(struct vcpu* vcpu, struct vgic_int* interrupt)
+cpumap_t vgic_int_ptarget_mask(struct vcpu* vcpu, struct vgic_int* interrupt)
 {
     if (vgic_broadcast(vcpu, interrupt)) {
-        return (uint8_t)(cpu()->vcpu->vm->cpus & ~(1U << cpu()->vcpu->phys_id));
+        cpumap_t m = cpu()->vcpu->vm->cpus & ~(1UL << cpu()->vcpu->phys_id);
+        INFO("bao_poc: flow5m ptarget_mask broadcast vcpu_id=%u phys_id=%u int_id=%u mask=0x%lx\n",
+            (unsigned)vcpu->id, (unsigned)vcpu->phys_id, (unsigned)interrupt->id,
+            (unsigned long)m);
+        return m;
     } else {
-        return (uint8_t)(1U << interrupt->phys.route);
+        unsigned route_u = (unsigned)(interrupt->phys.route & MPIDR_AFF_MSK);
+        unsigned pid = 0xffffffffU;
+        for (cpuid_t i = 0; i < platform.cpu_num; i++) {
+            if ((cpu_id_to_mpidr(i) & MPIDR_AFF_MSK) == route_u) {
+                pid = (unsigned)i;
+                break;
+            }
+        }
+        cpumap_t mask = (pid < 64U) ? (1UL << pid) : 0UL;
+        unsigned old_buggy = (route_u < 32U) ? (1U << route_u) : 0xffffffffU;
+        INFO("bao_poc: flow5m ptarget_mask FIXED vcpu_id=%u phys_id=%u int_id=%u "
+             "phys.route=0x%x mapped_phys_id=%u mask=0x%lx "
+             "old_issue1_buggy=0x%x old_issue2_uint8=0x%x\n",
+            (unsigned)vcpu->id, (unsigned)vcpu->phys_id, (unsigned)interrupt->id,
+            route_u, pid, (unsigned long)mask, old_buggy,
+            (unsigned)(uint8_t)(1U << interrupt->phys.route));
+        return mask;
     }
 }
 
@@ -59,6 +80,31 @@ static bool vgic_int_set_route(struct vcpu* vcpu, struct vgic_int* interrupt, un
         }
     }
     interrupt->phys.route = (uint32_t)phys_route;
+
+    {
+        unsigned route_u = (unsigned)(phys_route & MPIDR_AFF_MSK);
+        unsigned pid = 0xffffffffU;
+        unsigned tvcpu_id = 0xffffffffU;
+        if (phys_route != (uint64_t)GICD_IROUTER_INV) {
+            for (cpuid_t i = 0; i < platform.cpu_num; i++) {
+                if ((cpu_id_to_mpidr(i) & MPIDR_AFF_MSK) == (phys_route & MPIDR_AFF_MSK)) {
+                    pid = (unsigned)i;
+                    break;
+                }
+            }
+            struct vcpu* tv = vm_get_vcpu_by_mpidr(vcpu->vm, route & MPIDR_AFF_MSK);
+            if (tv != NULL) {
+                tvcpu_id = (unsigned)tv->id;
+            }
+        }
+        unsigned buggy = (route_u < 32U) ? (1U << route_u) : 0xffffffffU;
+        unsigned correct = (pid < 32U) ? (1U << pid) : 0xffffffffU;
+        INFO("bao_poc: flow4s vgic_int_set_route vcpu_id=%u phys_id=%u int_id=%u "
+             "guest_route=0x%lx tvcpu_id=%u phys.route=0x%x mapped_phys_id=%u "
+             "formula=phys_id_bit buggy=0x%x correct=0x%x\n",
+            (unsigned)vcpu->id, (unsigned)vcpu->phys_id, (unsigned)interrupt->id,
+            (unsigned long)(route & MPIDR_AFF_MSK), tvcpu_id, route_u, pid, buggy, correct);
+    }
 
     interrupt->route = route & GICD_IROUTER_RES0_MSK;
     return prev_route != interrupt->route;
@@ -166,6 +212,11 @@ static void vgicd_emul_router_access(struct emul_access* acc,
         } else {
             route = reg_value;
         }
+        INFO("bao_poc: flow3 vgicd_emul_router_access addr=0x%lx width=%u write=%d reg=%lu "
+             "irq_id=%u reg_value/route=0x%lx vcpu_id=%u phys_id=%u vgicr_id=%u\n",
+            (unsigned long)acc->addr, (unsigned)acc->width, acc->write ? 1 : 0,
+            (unsigned long)acc->reg, (unsigned)irq_id, (unsigned long)route,
+            (unsigned)cpu()->vcpu->id, (unsigned)cpu()->vcpu->phys_id, (unsigned)vgicr_id);
         vgic_int_set_field(handlers, cpu()->vcpu, interrupt, (unsigned long)route);
     }
 }
@@ -382,6 +433,13 @@ void vgic_init(struct vm* vm, const struct vgic_dscrp* vgic_dscrp)
 
     list_init(&vm->arch.vgic_spilled);
     vm->arch.vgic_spilled_lock = SPINLOCK_INITVAL;
+
+    for (cpuid_t i = 0; i < platform.cpu_num; i++) {
+        unsigned mpidr_u = (unsigned)(cpu_id_to_mpidr(i) & MPIDR_AFF_MSK);
+        unsigned mask = (i < 32U) ? (1U << (unsigned)i) : 0xffffffffU;
+        INFO("bao_poc: BAO-01 map phys_id=%u mpidr=0x%x formula=phys_id_bit mask=0x%x\n",
+            (unsigned)i, mpidr_u, mask);
+    }
 }
 
 void vgic_cpu_init(struct vcpu* vcpu)

@@ -21,6 +21,7 @@
 #include <interrupts.h>
 #include <vm.h>
 #include <platform.h>
+#include <bao.h>
 
 enum VGIC_EVENTS { VGIC_UPDATE_ENABLE, VGIC_ROUTE, VGIC_INJECT, VGIC_SET_REG };
 extern volatile const size_t VGIC_IPI_ID;
@@ -146,15 +147,39 @@ void vgic_send_sgi_msg(struct vcpu* vcpu, cpumap_t pcpu_mask, irqid_t int_id)
 
 static void vgic_route(struct vcpu* vcpu, struct vgic_int* interrupt)
 {
+    bool is_target;
+    bool other;
+    bool need_ipi;
+    bool log_spi = !gic_is_priv(interrupt->id) &&
+        (interrupt->phys.route != (unsigned int)GICD_IROUTER_INV);
+
     if ((interrupt->state == INV) || !interrupt->enabled) {
+        if (log_spi) {
+            INFO("bao_poc: flow5a vgic_route SKIP int_id=%u state=%u enabled=%d "
+                 "phys.route=0x%x (INV or disabled)\n",
+                (unsigned)interrupt->id, (unsigned)interrupt->state,
+                interrupt->enabled ? 1 : 0, (unsigned)interrupt->phys.route);
+        }
         return;
     }
 
-    if (vgic_int_vcpu_is_target(vcpu, interrupt)) {
+    is_target = vgic_int_vcpu_is_target(vcpu, interrupt);
+    if (is_target) {
         vgic_add_lr(vcpu, interrupt);
     }
 
-    if (!interrupt->in_lr && vgic_int_has_other_target(vcpu, interrupt)) {
+    other = vgic_int_has_other_target(vcpu, interrupt);
+    need_ipi = !interrupt->in_lr && other;
+    if (log_spi) {
+        INFO("bao_poc: flow5a vgic_route int_id=%u vcpu_id=%u phys_id=%u phys.route=0x%x "
+             "is_target=%d in_lr=%d has_other=%d need_ipi=%d -> %s\n",
+            (unsigned)interrupt->id, (unsigned)vcpu->id, (unsigned)vcpu->phys_id,
+            (unsigned)interrupt->phys.route, is_target ? 1 : 0, interrupt->in_lr ? 1 : 0,
+            other ? 1 : 0, need_ipi ? 1 : 0,
+            need_ipi ? "call_ptarget_mask" : "no_IPI_this_cpu_owns_or_in_lr");
+    }
+
+    if (need_ipi) {
         struct cpu_msg msg = {
             (uint32_t)VGIC_IPI_ID,
             VGIC_ROUTE,
@@ -162,8 +187,13 @@ static void vgic_route(struct vcpu* vcpu, struct vgic_int* interrupt)
         };
         vgic_yield_ownership(vcpu, interrupt);
         cpumap_t trgtlist = vgic_int_ptarget_mask(vcpu, interrupt) & ~(1UL << vcpu->phys_id);
+        INFO("bao_poc: flow5b vgic_route AFTER ptarget_mask int_id=%u phys.route=0x%x "
+             "trgtlist=0x%lx\n",
+            (unsigned)interrupt->id, (unsigned)interrupt->phys.route, (unsigned long)trgtlist);
         for (size_t i = 0; i < platform.cpu_num; i++) {
             if (trgtlist & (1ULL << i)) {
+                INFO("bao_poc: flow5c cpu_send_msg dest_phys_id=%u int_id=%u\n",
+                    (unsigned)i, (unsigned)interrupt->id);
                 cpu_send_msg(i, &msg);
             }
         }
@@ -688,8 +718,38 @@ void vgic_int_set_field(struct vgic_reg_handler_info* handlers, struct vcpu* vcp
     spin_lock(&interrupt->lock);
     if (vgic_get_ownership(vcpu, interrupt)) {
         vgic_remove_lr(vcpu, interrupt);
+        if (handlers->regid == VGIC_IROUTER_ID) {
+            INFO("bao_poc: flow4 vgic_int_set_field regid=%u vcpu_id=%u phys_id=%u "
+                 "int_id=%u data=0x%lx prev_route=0x%lx prev_phys=0x%x\n",
+                (unsigned)handlers->regid, (unsigned)vcpu->id, (unsigned)vcpu->phys_id,
+                (unsigned)interrupt->id, data, (unsigned long)interrupt->route,
+                (unsigned)interrupt->phys.route);
+        }
         if (handlers->update_field(vcpu, interrupt, data) && vgic_int_is_hw(interrupt)) {
             handlers->update_hw(vcpu, interrupt);
+        }
+        if (handlers->regid == VGIC_IROUTER_ID) {
+            unsigned route_u = (unsigned)(interrupt->phys.route & MPIDR_AFF_MSK);
+            unsigned pid = 0xffffffffU;
+            unsigned buggy, correct;
+            size_t bi;
+            INFO("bao_poc: flow4b after_update int_id=%u route=0x%lx phys.route=0x%x "
+                 "next=BUG_SITE_then_vgic_route\n",
+                (unsigned)interrupt->id, (unsigned long)interrupt->route,
+                (unsigned)interrupt->phys.route);
+            for (bi = 0; bi < platform.cpu_num; bi++) {
+                if ((cpu_id_to_mpidr((cpuid_t)bi) & MPIDR_AFF_MSK) == route_u) {
+                    pid = (unsigned)bi;
+                    break;
+                }
+            }
+            buggy = (route_u < 32U) ? (1U << route_u) : 0xffffffffU;
+            correct = (pid < 32U) ? (1U << pid) : 0xffffffffU;
+            INFO("bao_poc: flow4c BUG_SITE=vgic_int_ptarget_mask FIXED "
+                 "phys.route=0x%x mapped_phys_id=%u "
+                 "old_buggy_1_shl_mpidr=0x%x mask_1_shl_phys_id=0x%x "
+                 "old_ret_as_uint8=0x%x\n",
+                route_u, pid, buggy, correct, (unsigned)(uint8_t)(1U << interrupt->phys.route));
         }
         vgic_route(vcpu, interrupt);
         vgic_yield_ownership(vcpu, interrupt);
@@ -958,6 +1018,11 @@ bool vgicd_emul_handler(struct emul_access* acc)
                 handler_info = &itargetr_info;
             } else if (GICD_IS_REG(IROUTER, acc_off)) {
                 handler_info = &irouter_info;
+                INFO("bao_poc: flow2 vgicd_emul_handler acc.addr=0x%lx acc.width=%u acc.write=%d "
+                     "acc.reg=%lu acc_off=0x%lx vcpu_id=%u phys_id=%u\n",
+                    (unsigned long)acc->addr, (unsigned)acc->width, acc->write ? 1 : 0,
+                    (unsigned long)acc->reg, (unsigned long)acc_off,
+                    (unsigned)cpu()->vcpu->id, (unsigned)cpu()->vcpu->phys_id);
             } else if (GICD_IS_REG(ID, acc_off)) {
                 handler_info = &vgicd_pidr_info;
             } else {

@@ -88,10 +88,16 @@ static inline bool interrupt_assigned(irqid_t int_id)
     return bitmap_get(global_interrupt_bitmap, int_id);
 }
 
+// 인터럽트 처리
 enum irq_res interrupts_handle(irqid_t int_id)
 {
-    if (interrupts_arch_irq_is_forwardable(int_id) && vm_has_interrupt(cpu()->vcpu->vm, int_id)) {
-        vcpu_inject_hw_irq(cpu()->vcpu, int_id);
+    
+
+    if (interrupts_arch_irq_is_forwardable(int_id) // 항상 true
+        && vm_has_interrupt(cpu()->vcpu->vm, int_id) // VM이 처리 가능한 interrupt 인 경우
+    ) {
+        // VM에 인터럽트 전달
+            vcpu_inject_hw_irq(cpu()->vcpu, int_id);
 
         return FORWARD_TO_VM;
 
